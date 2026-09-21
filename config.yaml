@@ -1,0 +1,27 @@
+# zfs-backup-service configuration
+#
+# Copy to config.yaml and adjust. Run:  ./zfs-backup-service -config config.yaml
+
+# Local address:port for the HTTP API (default ":8080").
+# The service is meant to live on a Tailscale network; binding to 0.0.0.0
+# also exposes it on your LAN interfaces — restrict it with the firewall or
+# bind to your Tailscale IP if you care about that.
+listen: ":8080"
+
+# Dataset root where received backups are stored. Must be a full dataset
+# path (pool/name), e.g. a dedicated dataset on your pool. A dataset sent
+# as "tank/data" arrives here as "<receive_target>/tank/data". Created at
+# startup if it does not exist yet.
+receive_target: "tank/backups"
+
+# Directory for per-peer incremental backup state (default "state").
+state_dir: "state"
+
+# Remote ZFS nodes. Each id is used in the /send URL. Only `hostname` is
+# required; `port` defaults to 8080.
+peers:
+  office:
+    hostname: "office.tail1234abcd.ts.net"
+  home:
+    hostname: "home.tail1234abcd.ts.net"
+    port: 9090

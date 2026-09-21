@@ -1,0 +1,9 @@
+/zfs-backup-service
+/zfs-backup-service-stub
+/.stub-build/
+/.ref/
+/.gocache/
+/.go/
+/state/
+*.tmp
+/.smoke/
