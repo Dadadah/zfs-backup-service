@@ -1,5 +1,8 @@
 # zfs-backup-service
 
+> [!IMPORTANT]
+> Please note that this repo is not ready yet, do not run it in a production environment!
+
 A small Go microservice for snapshotting ZFS datasets and shipping them to
 another machine over a private network (intended: a Tailscale tailnet).
 **Each ZFS node runs its own copy of the service.** One `curl` against the
