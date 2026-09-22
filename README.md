@@ -39,7 +39,9 @@ This project is written entirely with a locally hosted LLM. All contributions to
 * OpenZFS **2.2 or newer** userspace libraries + headers (the vendored
   `go-libzfs` is patched for the 2.x API — see
   [third_party/go-libzfs/PATCHES.md](third_party/go-libzfs/PATCHES.md))
-* The service runs as **root** (it must create snapshots and receive datasets)
+* The service runs as **root or a normal user** — non-root needs the
+  `zfs allow` delegated privileges described in
+  [Running as a non-root user](#running-as-a-non-root-user)
 * A private network path between the nodes (Tailscale recommended)
 
 Distro packages for the dev libraries:
@@ -243,6 +245,14 @@ streams store the whole subtree there with the source pool name preserved.
 `receive_target/ds` — same-named datasets in different source pools would
 collide.)
 
+Before receiving, the service ensures every dataset in the destination path
+exists, **creating the destination itself when it is missing**. This is
+required for non-root receives (the kernel's receive permission check runs
+against the destination dataset and fails if it does not exist yet, so a
+full stream could never start); when running as root it is a harmless no-op
+in the common case, and a full stream is applied over the empty dataset via
+`-F`.
+
 Note the `-F` trade-off: if a destination dataset at the same path holds
 *other* data and a non-applicable stream arrives, `-F` lets the receive
 override it. The service assumes `receive_target` is dedicated to backups.
@@ -262,8 +272,9 @@ Error responses are JSON: `{"error": "..."}` with the matching status code:
 
 ## Running it
 
-The service needs to run as root and on a machine where the target pool is
-imported. A minimal systemd unit:
+The service runs on a machine where the target pool is imported. It works
+as root or as a normal user with the delegated privileges from the next
+section. A minimal systemd unit (non-root):
 
 ```ini
 [Unit]
@@ -274,11 +285,78 @@ Wants=network-online.target
 [Service]
 ExecStart=/opt/zfs-backup-service/zfs-backup-service -config /opt/zfs-backup-service/config.yaml
 Restart=on-failure
-User=root
+User=zfs-backup
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+(Use `User=root` instead if you prefer to run it privileged — no
+delegated-privilege setup is needed then.)
+
+## Running as a non-root user
+
+All ZFS operations the service performs are covered by a small set of
+delegated privileges, so it can run as an ordinary user (the example uses
+`zfs-backup`; any user or group works). Run the following **once, as
+root**, before starting the service.
+
+### Prerequisites on the receiving node
+
+```sh
+# 1. Create the receive target once. The service never creates top-level
+#    datasets — everything it creates lives *under* this one.
+zfs create tank/backups
+
+# 2. PREREQUISITE: the receive target subtree must stay unmounted.
+#    The service never mounts (it receives with -u) and never unmounts,
+#    and a forced overwrite (-F) cannot destroy a mounted dataset.
+#    canmount=off is hereditary, so this covers every dataset the
+#    service will create underneath.
+zfs set canmount=off tank/backups
+
+# 3. Delegate the privileges the service needs, on the receive target.
+#    Dataset-level grants are inherited by all child datasets, so this
+#    covers everything received under it (including recursive -R trees).
+zfs allow zfs-backup create,mount,snapshot,receive tank/backups
+```
+
+Why exactly these (OpenZFS 2.3 security-policy checks):
+
+| Permission | Needed for |
+|---|---|
+| `receive` | `zfs receive` itself |
+| `snapshot` | receiving creates snapshots in the destination (incremental receives) |
+| `create` | creating intermediate datasets and the destination before a receive (the check runs on the *parent*) |
+| `mount` | the `create` and `receive` checks require it to be held. It is **not used** — on Linux a non-root user still cannot actually mount, which is fine because the subtree stays unmounted (step 2) |
+
+No pool-level privilege is needed: the service only touches datasets under
+`receive_target`.
+
+### Prerequisites on the sending node
+
+```sh
+# Per dataset you back up. The grant is inherited by child datasets, which
+# is what makes recursive (?recursive=true, zfs send -R) transfers work.
+# (To cover an entire pool: zfs allow zfs-backup snapshot,send tank)
+zfs allow zfs-backup snapshot,send tank/data
+```
+
+| Permission | Needed for |
+|---|---|
+| `snapshot` | creating the auto-named snapshot (recursively, for `-R` transfers) |
+| `send` | streaming the snapshot to the peer |
+
+### Verifying
+
+```sh
+sudo -u zfs-backup zfs allow tank/backups    # show the effective grants
+sudo -u zfs-backup zfs allow tank/data       # (sending node)
+```
+
+The service logs its privilege mode at startup (a notice when it is not
+running as root), and ZFS permission errors in HTTP responses carry a hint
+pointing back to this section.
 
 ### Operational notes
 
@@ -294,6 +372,10 @@ WantedBy=multi-user.target
 * The service keeps the HTTP server alive even if the receive target dataset
   is missing (it logs a warning and keeps sending to peers); incoming
   transfers fail with a 500 until the target exists again.
+* When running as a non-root user, keep the receive target subtree
+  unmounted (`canmount=off`, see [Running as a non-root user](#running-as-a-non-root-user))
+  — the service never mounts or unmounts, and a forced overwrite cannot
+  destroy a mounted dataset.
 
 ## Dependencies
 

@@ -83,11 +83,18 @@ func (a *app) handleSend(w http.ResponseWriter, r *http.Request, ps httprouter.P
 			return
 		}
 	}
+	// Wire options for the send stream (mirrors the classic zfs send flags).
+	// Parsed here because a recursive transfer needs a recursive snapshot:
+	// zfs send -R sends the named snapshot across the whole subtree, so
+	// every child dataset must carry a snapshot of that name.
+	recursive := queryTrue(r, "recursive")
+	raw := queryTrue(r, "raw")
+
 	fullSnap := dsPath + "@" + snapName
 	if ex, err := zfs.DatasetOpenSingle(fullSnap); err != nil {
-		if _, err := zfs.DatasetSnapshot(fullSnap, false, nil); err != nil {
+		if _, err := zfs.DatasetSnapshot(fullSnap, recursive, nil); err != nil {
 			a.writeError(w, http.StatusInternalServerError,
-				"creating snapshot %s: %v", fullSnap, err)
+				"creating snapshot %s: %v%s", fullSnap, err, permissionHint(err))
 			return
 		}
 		created = true
@@ -129,10 +136,8 @@ func (a *app) handleSend(w http.ResponseWriter, r *http.Request, ps httprouter.P
 		}
 	}
 
-	// Wire options for the send stream (mirrors the classic zfs send flags).
+	// libzfs send flags for the stream (wire options parsed above).
 	sendFlags := zfs.SendFlags{}
-	recursive := queryTrue(r, "recursive")
-	raw := queryTrue(r, "raw")
 	if recursive {
 		sendFlags.Replicate = true // -R: recursive (all descendant datasets)
 	}

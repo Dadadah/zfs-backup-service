@@ -281,9 +281,18 @@ zfs_handle_t *
 zfs_open(libzfs_handle_t *hdl, const char *name, int flags)
 {
 	struct stub_zfs_handle *sh;
+	const char *missing;
 
 	(void)hdl;
 	(void)flags;
+	/* Test hook: ZFS_STUB_MISSING is a name that zfs_open must report
+	 * as absent, so a test can drive the create-a-snapshot path. */
+	missing = getenv("ZFS_STUB_MISSING");
+	if (missing != NULL && *missing != '\0' &&
+	    strcmp(name, missing) == 0) {
+		set_err("stub: dataset not found");
+		return NULL;
+	}
 	sh = calloc(1, sizeof(*sh));
 	if (sh == NULL) {
 		set_err(STUB_ERR);
@@ -348,9 +357,17 @@ zfs_snapshot(libzfs_handle_t *hdl, const char *name, boolean_t recurse,
     nvlist_t *nv)
 {
 	(void)hdl;
-	(void)name;
-	(void)recurse;
 	(void)nv;
+	/* Record the snapshot + recursion flag so a test can verify a
+	 * recursive transfer created a recursive snapshot. */
+	{
+		FILE *lf = fopen("stub-transfer.log", "a");
+		if (lf != NULL) {
+			fprintf(lf, "SNAP name=%s recurse=%d\n", name,
+			    (int)recurse);
+			fclose(lf);
+		}
+	}
 	return 0;
 }
 

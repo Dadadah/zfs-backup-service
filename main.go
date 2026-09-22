@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -61,6 +62,11 @@ func main() {
 				DialContext: (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
 			},
 		},
+	}
+
+	if os.Geteuid() != 0 {
+		log.Printf("running as uid %d (non-root): ZFS operations rely on delegated privileges (zfs allow) — see README \"Running as a non-root user\"",
+			os.Geteuid())
 	}
 
 	a.checkReceiveTarget()
@@ -111,7 +117,8 @@ func (a *app) checkReceiveTarget() {
 	}
 	log.Printf("WARNING: receive target %q is not an open dataset, attempting to create it", target)
 	if ds, err := zfs.DatasetCreate(target, zfs.DatasetTypeFilesystem, nil); err != nil {
-		log.Printf("WARNING: could not create receive target %q: %v (incoming transfers will fail until it exists)", target, err)
+		log.Printf("WARNING: could not create receive target %q: %v (incoming transfers will fail until it exists; when running as a non-root user, create it once as root — see README \"Running as a non-root user\")",
+			target, err)
 	} else {
 		ds.Close()
 		log.Printf("created receive target dataset %q", target)
@@ -154,6 +161,22 @@ func (a *app) writeJSON(w http.ResponseWriter, code int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("writing response: %v", err)
 	}
+}
+
+// permissionHint returns a short hint to append to an error message when a
+// ZFS operation failed for lack of delegated privileges, pointing at the
+// non-root setup documentation.
+func permissionHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "no permission") ||
+		strings.Contains(s, "permission denied") ||
+		strings.Contains(s, "eacces") {
+		return " (hint: if running as a non-root user, the required delegated privileges may be missing — see README \"Running as a non-root user\")"
+	}
+	return ""
 }
 
 // writeError sends a JSON error response.

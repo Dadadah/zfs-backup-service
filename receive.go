@@ -58,11 +58,11 @@ func (a *app) handleReceive(w http.ResponseWriter, r *http.Request, ps httproute
 	} else {
 		rt.Close()
 	}
-	// Create intermediate datasets (everything except the final element,
-	// which the stream itself creates).
+	// Ensure every dataset in the destination path exists, including the
+	// final one (see ensureDatasets).
 	if err := ensureDatasets(a.cfg.ReceiveTarget, dsPath); err != nil {
 		a.writeError(w, http.StatusInternalServerError,
-			"preparing destination %q: %v", dest, err)
+			"preparing destination %q: %v%s", dest, err, permissionHint(err))
 		return
 	}
 
@@ -94,7 +94,8 @@ func (a *app) handleReceive(w http.ResponseWriter, r *http.Request, ps httproute
 			a.writeError(w, http.StatusInternalServerError,
 				"zfs receive failed (stream: %v; client: %v)", rerr, cerr)
 		} else {
-			a.writeError(w, http.StatusInternalServerError, "zfs receive failed: %v", rerr)
+			a.writeError(w, http.StatusInternalServerError,
+				"zfs receive failed: %v%s", rerr, permissionHint(rerr))
 		}
 		return
 	}
@@ -111,11 +112,17 @@ func (a *app) handleReceive(w http.ResponseWriter, r *http.Request, ps httproute
 	})
 }
 
-// ensureDatasets creates every intermediate dataset between root and
-// root/<dsPath>, excluding the final element (the stream creates it).
+// ensureDatasets opens every dataset between root and root/<dsPath>,
+// creating any that are missing — including the final destination itself.
+// Pre-creating the destination is required for non-root receives: the
+// kernel's receive permission check runs against the destination dataset and
+// fails if it does not exist yet, so a full stream could never start for a
+// non-root user. When running as root this is a harmless no-op in the
+// common (already exists) case, and a full stream is then applied over the
+// freshly created empty dataset via -F.
 func ensureDatasets(root, dsPath string) error {
 	parts := strings.Split(dsPath, "/")
-	for i := 1; i < len(parts); i++ {
+	for i := 1; i <= len(parts); i++ {
 		p := root + "/" + strings.Join(parts[:i], "/")
 		if ex, err := zfs.DatasetOpenSingle(p); err == nil {
 			ex.Close()
@@ -126,7 +133,11 @@ func ensureDatasets(root, dsPath string) error {
 			return err
 		}
 		ds.Close()
-		log.Printf("created intermediate dataset %q", p)
+		if i < len(parts) {
+			log.Printf("created intermediate dataset %q", p)
+		} else {
+			log.Printf("created destination dataset %q", p)
+		}
 	}
 	return nil
 }
