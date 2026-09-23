@@ -1,0 +1,46 @@
+# Copyright 2026 dadadah
+#
+# SPDX-License-Identifier: MIT
+#
+# zfs-backup-service in Docker — posture B (rootless + delegated
+# "zfs allow" privileges; see README "Running in Docker").
+#
+# Before the first start, run ONCE AS ROOT on this machine:
+#
+#   # receiving node:
+#   zfs create   <pool>/backups
+#   zfs set      canmount=off <pool>/backups
+#   zfs allow    <uid> create,mount,snapshot,receive <pool>/backups
+#
+#   # sending node (per dataset you back up):
+#   zfs allow    <uid> snapshot,send <pool>/<dataset>
+#
+# where <uid> is the UID the container process runs as ON THE HOST
+# (see the "user:" note below).
+
+services:
+  zfs-backup:
+    build: .
+    container_name: zfs-backup
+    # The uid/gid here must be the host identity that received the
+    # "zfs allow" grants. With rootless Docker the in-container uid
+    # usually maps straight onto the host user that runs Docker; with
+    # rootful Docker + userns-remap the mapping is defined by your
+    # subuid/subgid ranges. Verify with: docker exec zfs-backup id
+    user: "1000:1000"
+    # The only device the service needs: it talks to the host's ZFS
+    # kernel module through ioctls on /dev/zfs and never mounts anything.
+    devices:
+      - /dev/zfs
+    volumes:
+      - ./config.docker.yaml:/etc/zfs-backup/config.yaml:ro
+      - zfs-backup-state:/var/lib/zfs-backup
+    ports:
+      # Tailnet/localhost only. For a Tailscale deployment either run
+      # tailscaled as a sidecar (needs /dev/net/tun + NET_ADMIN) or use
+      # "network_mode: host" instead of ports.
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
+volumes:
+  zfs-backup-state:

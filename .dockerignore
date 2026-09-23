@@ -1,0 +1,10 @@
+.git
+.gitignore
+.smoke
+.ref
+.gocache
+.go
+state
+zfs-backup-service
+*.tmp
+docker-compose.yml

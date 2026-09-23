@@ -48,10 +48,26 @@ Distro packages for the dev libraries:
 
 | Distro        | Package(s)                                          |
 |---------------|-----------------------------------------------------|
-| Debian/Ubuntu | `libzfs-dev` `libnvpair-dev` `libspl-dev`           |
-| Fedora        | `zfs-devel` (provides the `libzfs`/`libspl` headers)|
+| Debian/Ubuntu | `libzfslinux-dev` (older releases: `libzfs-dev` `libnvpair-dev` `libspl-dev`) |
+| Fedora        | `libzfs6-devel` (OpenZFS 2.3.x) or `libzfs7-devel` (2.4.x) — see below |
 | openSUSE      | `zfsutils` devel package (`libzfs-devel`)           |
 | NixOS         | `pkgs.zfs` (unfree) with `dev` output               |
+
+Plus a C compiler (`gcc`) and Go 1.21+ (`golang` on Fedora).
+
+On Fedora, OpenZFS is not in the base repositories — add the [OpenZFS
+project's repo](https://openzfs.github.io/openzfs-docs/Getting%20Started/Fedora/index.html)
+first (e.g. Fedora 44), then install the devel package matching the
+OpenZFS generation you run:
+
+```sh
+sudo dnf install -y https://zfsonlinux.org/fedora/zfs-release-3-1.fc44.noarch.rpm
+sudo dnf install -y golang gcc libzfs6-devel   # 2.3.x; use libzfs7-devel for 2.4.x
+```
+
+(The devel package also pulls in the runtime libraries, and the `zfs`
+package installs the kernel module via DKMS — keep the userspace and
+kernel module on the same generation.)
 
 ## Building
 
@@ -64,19 +80,6 @@ or directly:
 ```sh
 go build -o zfs-backup-service .
 ```
-
-### Building on a machine without ZFS (verification only)
-
-If you just want to compile-check the code (or exercise the HTTP plumbing)
-on a machine that has no ZFS at all, `make stub-build` downloads the pinned
-OpenZFS source for its headers and builds tiny stub libraries that mimic the
-API. The resulting `zfs-backup-service-stub` starts and serves HTTP, and the
-send→pipe→receive pipeline works end-to-end between two instances (dataset
-open/snapshot/create succeed in the stub; `zfs send`/`zfs receive` exchange
-a marker stream — set `ZFS_STUB_STREAM_BYTES=N` to pad the stream to N
-bytes, which is how the deadlock-free transfer path was tested). Operations
-outside that pipeline fail with a "stub" error. See
-[build/stubs/prepare.sh](build/stubs/prepare.sh).
 
 ## Configuration
 
@@ -358,6 +361,13 @@ The service logs its privilege mode at startup (a notice when it is not
 running as root), and ZFS permission errors in HTTP responses carry a hint
 pointing back to this section.
 
+At startup the service also runs a **self-check** and refuses to start when
+it could not possibly work: when `/dev/zfs` is missing or not accessible,
+when the receive target cannot be opened, or — as a non-root user — when
+the delegated permissions required for receiving (`receive,snapshot,create,
+mount`) are missing on the receive target (it prints the exact `zfs allow`
+command to fix it).
+
 ### Operational notes
 
 * **No TLS, no authentication — by design.** Anyone who can reach the
@@ -376,6 +386,92 @@ pointing back to this section.
   unmounted (`canmount=off`, see [Running as a non-root user](#running-as-a-non-root-user))
   — the service never mounts or unmounts, and a forced overwrite cannot
   destroy a mounted dataset.
+
+## Running in Docker
+
+The container is a **thin client to the host's ZFS kernel module**: it
+only issues dataset-level ioctls on `/dev/zfs` and never mounts anything,
+so no kernel module and no pool filesystem is needed inside the image —
+just the host device passed in and the OpenZFS userspace libraries
+(bundled). The host must have the OpenZFS module loaded and the pool
+imported.
+
+### Prerequisites (on the host, once, as root)
+
+Identical to [Running as a non-root user](#running-as-a-non-root-user) —
+the receive target must exist with `canmount=off`, and the `zfs allow`
+grants must be in place. The one difference: the grants go to **the UID
+the container process has on the host**, not to a username. With
+rootless Docker that is the uid of the user running Docker (or the one set
+via `user:` in the compose file); with `--userns-remap` it is the mapped
+host uid. Verify with `docker exec zfs-backup id`.
+
+```sh
+# Receiving node:
+zfs create   tank/backups
+zfs set      canmount=off tank/backups
+zfs allow    <host-uid> create,mount,snapshot,receive tank/backups
+
+# Sending node (per dataset you back up):
+zfs allow    <host-uid> snapshot,send tank/data
+```
+
+### Build and run
+
+```sh
+docker build -t zfs-backup-service .
+```
+
+**Posture B (default — no root, no extra capabilities):** the container
+runs as an ordinary user and relies on the delegated privileges above.
+The included `docker-compose.yml` (with `config.docker.yaml` as the config
+example) is set up for this; `user: "1000:1000"` must be the host
+identity that received the grants:
+
+```sh
+cp config.docker.yaml config.docker.yaml.local   # and edit it
+docker compose up -d
+```
+
+or without compose:
+
+```sh
+docker run -d --name zfs-backup \
+    --user 1000:1000 \
+    --device /dev/zfs \
+    -v $PWD/config.docker.yaml:/etc/zfs-backup/config.yaml:ro \
+    -v zfs-backup-state:/var/lib/zfs-backup \
+    -p 127.0.0.1:8080:8080 \
+    zfs-backup-service
+```
+
+**Posture A (fallback — rootful, `CAP_SYS_ADMIN`):** if you would rather
+not set up delegated privileges, run the container as root with
+`--cap-add SYS_ADMIN` (and no `--user`) instead. The kernel then
+authorizes every operation via the capability, and no `zfs allow` grants
+are needed. This works, but note the container's root *is* the host's
+root — it is far less isolated than posture B and is only recommended if
+isolation is not a concern.
+
+The **startup self-check** covers the common container misconfigurations:
+a missing `--device /dev/zfs`, an unusable device, or missing delegated
+grants all produce a clear, actionable fatal message at boot (the service
+refuses to start rather than serving broken transfers).
+
+### Tailscale in the container
+
+Either run `tailscaled` as a sidecar container (needs `/dev/net/tun` and
+`NET_ADMIN`, sharing a network namespace with the service) or run the
+service with `network_mode: host` and tailscaled on the host.
+
+### Limitations
+
+* The container runs the backup service; it does not give you mounted
+  access to the received backups — inspect them on the host.
+* The image is built against OpenZFS 2.2 userspace (Ubuntu 24.04 base);
+  the host should run a compatible 2.2+ kernel module.
+* Everything else in [Operational notes](#operational-notes) applies
+  unchanged.
 
 ## Dependencies
 
@@ -397,7 +493,6 @@ config.go     YAML config loading + validation
 send.go       POST /send/... — snapshot + stream a dataset to a peer
 receive.go    POST /receive/... — accept a stream into receive_target
 state.go      per-peer incremental state (JSON files)
-build/stubs/  stub library toolchain for ZFS-less compile verification
 third_party/  vendored, patched go-libzfs
 ```
 

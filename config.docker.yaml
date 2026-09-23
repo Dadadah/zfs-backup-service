@@ -1,0 +1,19 @@
+# Copyright 2026 dadadah
+#
+# SPDX-License-Identifier: MIT
+#
+# Example configuration for the Docker deployment (mounted into the
+# container at /etc/zfs-backup/config.yaml by docker-compose.yml).
+#
+# state_dir must match the mounted volume path from docker-compose.yml.
+# adjust listen to your network: "0.0.0.0:8080" if the container reaches
+# the tailnet directly, "127.0.0.1:8080" plus a published port otherwise.
+
+listen: "0.0.0.0:8080"
+receive_target: "tank/backups"
+state_dir: "/var/lib/zfs-backup"
+
+peers:
+  other-node:
+    hostname: "other-node.tail1234.ts.net"
+    port: 8080

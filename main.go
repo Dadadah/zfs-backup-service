@@ -69,7 +69,7 @@ func main() {
 			os.Geteuid())
 	}
 
-	a.checkReceiveTarget()
+	a.checkZfsAccess()
 
 	r := httprouter.New()
 	r.NotFound = http.HandlerFunc(handleNotFound)
@@ -106,23 +106,90 @@ func main() {
 	}
 }
 
-// checkReceiveTarget verifies that the configured receive target dataset is
-// usable, creating it when possible. A failure is only a warning: the node
-// can still send backups to peers until the target is fixed.
-func (a *app) checkReceiveTarget() {
+// checkZfsAccess is the startup self-check. It refuses to start when the
+// service could not possibly work:
+//
+//   - libzfs failed to initialize (typically /dev/zfs missing or not
+//     accessible — e.g. a container where the device was not passed in),
+//   - opening the receive target fails with a permission error (this user
+//     cannot talk to ZFS at all),
+//   - running as a non-root user and the delegated permissions required
+//     for receiving (receive, snapshot, create, mount) are missing on the
+//     receive target.
+//
+// A target that is merely missing is only a warning when it also cannot be
+// created: the node can still send backups to peers until the target is
+// fixed.
+func (a *app) checkZfsAccess() {
 	target := a.cfg.ReceiveTarget
-	if ds, err := zfs.DatasetOpenSingle(target); err == nil {
-		ds.Close()
-		return
+
+	if zfs.LibzfsInitFailed() {
+		log.Fatalf("cannot access ZFS: libzfs failed to initialize — is /dev/zfs present and accessible? (in a container, pass it in with --device /dev/zfs; see README \"Running in Docker\")")
 	}
-	log.Printf("WARNING: receive target %q is not an open dataset, attempting to create it", target)
-	if ds, err := zfs.DatasetCreate(target, zfs.DatasetTypeFilesystem, nil); err != nil {
-		log.Printf("WARNING: could not create receive target %q: %v (incoming transfers will fail until it exists; when running as a non-root user, create it once as root — see README \"Running as a non-root user\")",
-			target, err)
-	} else {
+
+	ds, err := zfs.DatasetOpenSingle(target)
+	if err != nil {
+		if isPermissionError(err) {
+			log.Fatalf("cannot open receive target %q: %v — this user cannot access ZFS datasets (check /dev/zfs device access and the uid's group membership; in a container: --device /dev/zfs and a uid matching the \"zfs allow\" grants — see README \"Running in Docker\" / \"Running as a non-root user\")",
+				target, err)
+		}
+		log.Printf("WARNING: receive target %q is not an open dataset, attempting to create it", target)
+		if ds, err = zfs.DatasetCreate(target, zfs.DatasetTypeFilesystem, nil); err != nil {
+			log.Printf("WARNING: could not create receive target %q: %v (incoming transfers will fail until it exists; when running as a non-root user, create it once as root — see README \"Running as a non-root user\")",
+				target, err)
+			return
+		}
 		ds.Close()
 		log.Printf("created receive target dataset %q", target)
+	} else {
+		ds.Close()
 	}
+
+	if os.Geteuid() == 0 {
+		return // root: CAP_SYS_ADMIN satisfies every secpolicy check
+	}
+	a.checkDelegatedPerms(target)
+}
+
+// checkDelegatedPerms verifies, read-only (zfs_get_fsacl) and without
+// creating any datasets, that this user holds the delegated permissions
+// the service needs on the receive target, and refuses to start otherwise.
+func (a *app) checkDelegatedPerms(target string) {
+	perms := []string{"receive", "snapshot", "create", "mount"}
+
+	ds, err := zfs.DatasetOpenSingle(target)
+	if err != nil {
+		log.Printf("WARNING: cannot re-open receive target %q for the permission check: %v", target, err)
+		return
+	}
+	defer ds.Close()
+
+	uid := uint64(os.Getuid())
+	var gids []uint64
+	if groups, err := os.Getgroups(); err == nil {
+		for _, g := range groups {
+			gids = append(gids, uint64(g))
+		}
+	}
+
+	mask, err := ds.DelegatedPermissionMask(uid, gids, perms)
+	if err != nil {
+		log.Printf("WARNING: cannot read delegated permissions of %q: %v (skipping the permission check)", target, err)
+		return
+	}
+
+	var missing []string
+	for i, p := range perms {
+		if mask&(uint64(1)<<i) == 0 {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) > 0 {
+		log.Fatalf("missing delegated ZFS permissions on receive target %q: %s — as root run: zfs allow <this-user> %s %s (see README \"Running as a non-root user\")",
+			target, strings.Join(missing, ", "), strings.Join(perms, ","), target)
+	}
+	log.Printf("delegated permission check passed on %q (uid %d: %s)",
+		target, uid, strings.Join(perms, ","))
 }
 
 // handleIndex describes the service and its endpoints.
@@ -163,20 +230,30 @@ func (a *app) writeJSON(w http.ResponseWriter, code int, v any) {
 	}
 }
 
+// isPermissionError reports whether err looks like a ZFS/device permission
+// failure (as opposed to, e.g., "dataset does not exist"). libzfs error
+// text is the only interface available without shelling out, so this is
+// deliberately a string match on the common phrasings.
+func isPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no permission") ||
+		strings.Contains(s, "permission denied") ||
+		strings.Contains(s, "eacces") ||
+		strings.Contains(s, "eperm") ||
+		strings.Contains(s, "operation not permitted")
+}
+
 // permissionHint returns a short hint to append to an error message when a
 // ZFS operation failed for lack of delegated privileges, pointing at the
 // non-root setup documentation.
 func permissionHint(err error) string {
-	if err == nil {
+	if !isPermissionError(err) {
 		return ""
 	}
-	s := strings.ToLower(err.Error())
-	if strings.Contains(s, "no permission") ||
-		strings.Contains(s, "permission denied") ||
-		strings.Contains(s, "eacces") {
-		return " (hint: if running as a non-root user, the required delegated privileges may be missing — see README \"Running as a non-root user\")"
-	}
-	return ""
+	return " (hint: if running as a non-root user, the required delegated privileges may be missing — see README \"Running as a non-root user\")"
 }
 
 // writeError sends a JSON error response.
